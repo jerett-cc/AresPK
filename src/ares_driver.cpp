@@ -95,21 +95,18 @@ TaskCollection AresDriver::MakeTaskCollection(BlockList_t &blocks, int stage) {
   // This region contains one tasklist per pack, note that
   // tasklists could still be executed in parallel
   const int num_partitions = pmesh->DefaultNumPartitions();
-  int reg_dep_id;
   TaskRegion &flux_region = tc.AddRegion(num_partitions);
   for (int i = 0; i < num_partitions; i++) {
     auto &tl = flux_region[i];
     auto &mu0 = pmesh->mesh_data.GetOrAdd("base", i);
-
-    reg_dep_id = 0;
-
+    /* Jerett- My theory is that the calls flux_region.AddRegionalDependencies(...)
+       are simply superfluous if onw first makes sure that the loc_CoM depends on itself, 
+       since dependencies are inherited.
+    */
+    // There are now TaskQualifiers which presumably can replace AddRegionalDependency.
+    // Open question is whether to use local or global?
     // Pass a pointer to CoM to be reduced into
-    auto loc_CoM = tl.AddTask(none, utils::SumMass, mu0.get(), &CoM.val);
-
-    // Make local reduce a regional dependency so dependent tasks can't execute until
-    // all lists finish
-    flux_region.AddRegionalDependencies(reg_dep_id, i, loc_CoM);
-    reg_dep_id++;
+    auto loc_CoM = tl.AddTask(TaskQualifier::local_sync, none, utils::SumMass, mu0.get(), &CoM.val);
 
     // Start a global non-blocking MPI_Iallreduce
     auto start_global_CoM =
@@ -118,9 +115,7 @@ TaskCollection AresDriver::MakeTaskCollection(BlockList_t &blocks, int stage) {
                 : none);
 
     auto finish_global_CoM =
-        tl.AddTask(start_global_CoM, &AllReduce<std::vector<Real>>::CheckReduce, &CoM);
-    flux_region.AddRegionalDependencies(reg_dep_id, i, finish_global_CoM);
-    reg_dep_id++;
+        tl.AddTask(TaskQualifier::local_sync, start_global_CoM, &AllReduce<std::vector<Real>>::CheckReduce, &CoM);
 
     // Convert CoM to [xcenter, ycenter, zcenter, total mass, edge radius] instead
     // of weighted [x total, y total, z total, total mass, total volume]
@@ -153,9 +148,7 @@ TaskCollection AresDriver::MakeTaskCollection(BlockList_t &blocks, int stage) {
 
     // Compute mass bins for gravity
     auto local_bin =
-        tl.AddTask(simplify_CoM, utils::BinMasses, mu0.get(), &mass_bins.val, &CoM.val);
-    flux_region.AddRegionalDependencies(reg_dep_id, i, local_bin);
-    reg_dep_id++;
+        tl.AddTask(TaskQualifier::local_sync, simplify_CoM, utils::BinMasses, mu0.get(), &mass_bins.val, &CoM.val);
 
     auto start_global_bin =
         (i == 0 ? tl.AddTask(local_bin, &AllReduce<std::vector<Real>>::StartReduce,
@@ -163,9 +156,7 @@ TaskCollection AresDriver::MakeTaskCollection(BlockList_t &blocks, int stage) {
                 : none);
 
     auto finish_global_bin = tl.AddTask(
-        start_global_bin, &AllReduce<std::vector<Real>>::CheckReduce, &mass_bins);
-    flux_region.AddRegionalDependencies(reg_dep_id, i, finish_global_bin);
-    reg_dep_id++;
+        TaskQualifier::local_sync, start_global_bin, &AllReduce<std::vector<Real>>::CheckReduce, &mass_bins);
 
     // Convert mass bins to mass enclosed by inclusive scan
     auto simplify_bin = tl.AddTask(
@@ -196,8 +187,8 @@ TaskCollection AresDriver::MakeTaskCollection(BlockList_t &blocks, int stage) {
                            : none);
 
     const auto any = parthenon::BoundaryType::any;
-    tl.AddTask(none, parthenon::cell_centered_bvars::StartReceiveBoundBufs<any>, mu0);
-    tl.AddTask(none, parthenon::cell_centered_bvars::StartReceiveFluxCorrections, mu0);
+    tl.AddTask(none, parthenon::StartReceiveBoundBufs<any>, mu0);
+    tl.AddTask(none, parthenon::StartReceiveFluxCorrections, mu0);
 
     // Calculate gravity source terms
     const auto gravity_str = (stage == 1) ? "gravity_first_stage" : "gravity_other_stage";
@@ -217,11 +208,11 @@ TaskCollection AresDriver::MakeTaskCollection(BlockList_t &blocks, int stage) {
 
     // Correct for fluxes across levels (to maintain conservative nature of update)
     auto send_flx = tl.AddTask(
-        calc_flux, parthenon::cell_centered_bvars::LoadAndSendFluxCorrections, mu0);
+        calc_flux, parthenon::LoadAndSendFluxCorrections, mu0);
     auto recv_flx = tl.AddTask(
-        calc_flux, parthenon::cell_centered_bvars::ReceiveFluxCorrections, mu0);
+        calc_flux, parthenon::ReceiveFluxCorrections, mu0);
     auto set_flx =
-        tl.AddTask(recv_flx, parthenon::cell_centered_bvars::SetFluxCorrections, mu0);
+        tl.AddTask(recv_flx, parthenon::SetFluxCorrections, mu0);
 
     // Compute the divergence of fluxes of conserved variables
     auto update = tl.AddTask(
@@ -238,7 +229,7 @@ TaskCollection AresDriver::MakeTaskCollection(BlockList_t &blocks, int stage) {
     // Update ghost cells (local and non local)
     // Note that Parthenon also support to add those tasks manually for more fine-grained
     // control.
-    parthenon::cell_centered_bvars::AddBoundaryExchangeTasks(calc_gravity | calc_network,
+    parthenon::AddBoundaryExchangeTasks(calc_gravity | calc_network,
                                                              tl, mu0, pmesh->multilevel);
   }
 
@@ -246,13 +237,14 @@ TaskCollection AresDriver::MakeTaskCollection(BlockList_t &blocks, int stage) {
   for (int i = 0; i < blocks.size(); i++) {
     auto &tl = async_region_3[i];
     auto &u0 = blocks[i]->meshblock_data.Get("base");
+    // auto &u0 = pmesh->block_data()
     auto prolongBound = none;
     if (pmesh->multilevel) {
-      prolongBound = tl.AddTask(none, parthenon::ProlongateBoundaries, u0);
+      // prolongBound = tl.AddTask(none, parthenon::ProlongateBoundaries, u0->GetBlockPointer());
     }
 
     // set physical boundaries
-    auto set_bc = tl.AddTask(prolongBound, parthenon::ApplyBoundaryConditions, u0);
+    // auto set_bc = tl.AddTask(prolongBound, parthenon::ApplyBoundaryConditions, u0->GetBlockPointer());
   }
 
   TaskRegion &single_tasklist_per_pack_region_3 = tc.AddRegion(num_partitions);
