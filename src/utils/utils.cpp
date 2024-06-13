@@ -3,6 +3,7 @@
 #include <cmath>
 
 #include "../main.hpp"
+#include "utils.hpp"
 
 // Plog header
 #include <plog/Log.h>
@@ -10,13 +11,13 @@
 using namespace parthenon;
 
 namespace utils {
-bool ShouldLog(int partition, bool log_per_process = false,
-               bool log_per_partition = false) {
+bool ShouldLog(int partition, bool log_per_process,
+               bool log_per_partition) {
   return ((partition == 0 || log_per_partition) &&
           (Globals::my_rank == 0 || log_per_process));
 }
 
-std::string TaskInfo(int i = -1) {
+std::string TaskInfo(int i) {
   if (i == -1) {
     return "[Process " + std::to_string(Globals::my_rank) + "] ";
   } else {
